@@ -65,6 +65,9 @@ ggml_tensor* ggml_ext_gelu_quick(ggml_context* ctx,
                                  ggml_tensor* x,
                                  bool inplace = false);
 
+// true while a graph for a non-CPU backend is being built (set by GGMLRunner::get_compute_graph); the f16 activation cast needs it
+extern thread_local bool g_ggml_ext_gpu_graph;
+
 ggml_tensor* ggml_ext_linear(ggml_context* ctx,
                              ggml_tensor* x,
                              ggml_tensor* w,
@@ -223,7 +226,8 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                                     bool flash_attn       = false,
                                     float kv_scale        = 1.0f,
                                     bool sage_attn        = false,
-                                    bool* used_flash_attn = nullptr);
+                                    bool* used_flash_attn = nullptr,
+                                    ggml_tensor* sinks    = nullptr);
 
 ggml_tensor* ggml_ext_layer_norm(ggml_context* ctx,
                                  ggml_tensor* x,

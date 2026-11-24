@@ -127,8 +127,18 @@ namespace Anima {
             auto scale      = emb_chunks[1];
             auto gate       = emb_chunks[2];
 
+            // norm(x) * (1 + scale) + shift as adjacent norm -> mul -> add nodes, which the Vulkan backend fuses into one pass.
+            // The graph is built depth first, so scale and shift are expanded before the norm; otherwise their timestep MLP
+            // lands between the norm and the mul.
+            scale = ggml_reshape_3d(ctx->ggml_ctx, ggml_scale_bias(ctx->ggml_ctx, scale, 1.0f, 1.0f), scale->ne[0], 1, scale->ne[1]);  // [N, 1, C]
+            shift = ggml_reshape_3d(ctx->ggml_ctx, shift, shift->ne[0], 1, shift->ne[1]);
+            if (ctx->graph != nullptr) {
+                ggml_build_forward_expand(ctx->graph, scale);
+                ggml_build_forward_expand(ctx->graph, shift);
+                ggml_build_forward_expand(ctx->graph, gate);  // its cont would otherwise split mul_mat -> gate mul -> residual add
+            }
             auto x = norm->forward(ctx, hidden_states);
-            x      = Flux::modulate(ctx->ggml_ctx, x, shift, scale);
+            x      = ggml_add(ctx->ggml_ctx, ggml_mul(ctx->ggml_ctx, x, scale), shift);
 
             return {x, gate};
         }
@@ -200,7 +210,10 @@ namespace Anima {
                              ggml_tensor* hidden_states,
                              ggml_tensor* encoder_hidden_states = nullptr,
                              ggml_tensor* pe_q                  = nullptr,
-                             ggml_tensor* pe_k                  = nullptr) {
+                             ggml_tensor* pe_k                  = nullptr,
+                             int64_t kv_zero_pad                = 0,
+                             const std::string& kv_cache        = "",
+                             bool kv_cached                     = false) {
             if (encoder_hidden_states == nullptr) {
                 encoder_hidden_states = hidden_states;
             }
@@ -213,8 +226,26 @@ namespace Anima {
             auto out_proj = std::dynamic_pointer_cast<Linear>(blocks[out_proj_name]);
 
             auto q = q_proj->forward(ctx, hidden_states);
-            auto k = k_proj->forward(ctx, encoder_hidden_states);
-            auto v = v_proj->forward(ctx, encoder_hidden_states);
+            ggml_tensor* k = nullptr;
+            ggml_tensor* v = nullptr;
+            if (kv_cached) {
+                // k after its norm and v of the text context, as f16, from the first step (see AnimaRunner)
+                k = ctx->load_cache_tensor(kv_cache + ".k");
+                v = ctx->load_cache_tensor(kv_cache + ".v");
+                GGML_ASSERT(k != nullptr && v != nullptr);
+                k = ggml_reshape_3d(ctx->ggml_ctx, k, k->ne[0] * k->ne[1], k->ne[2], k->ne[3]);
+            } else {
+                k = k_proj->forward(ctx, encoder_hidden_states);
+                v = v_proj->forward(ctx, encoder_hidden_states);
+            }
+            ggml_tensor* sinks = nullptr;
+            if (kv_zero_pad > 0) {
+                // The context is zero padded to a fixed length. The projections have no bias and the RMS norm keeps
+                // zero rows at zero, so each padded key scores 0 and adds exp(0) = 1 to the softmax denominator and
+                // nothing to the output: a sink of log(kv_zero_pad) per head gives the same result without the padding.
+                sinks = ggml_scale_bias(ctx->ggml_ctx, ggml_arange(ctx->ggml_ctx, 0.0f, static_cast<float>(num_heads), 1.0f),
+                                        0.0f, logf(static_cast<float>(kv_zero_pad)));
+            }
 
             int64_t N   = q->ne[2];
             int64_t L_q = q->ne[1];
@@ -224,8 +255,19 @@ namespace Anima {
             auto k4 = ggml_reshape_4d(ctx->ggml_ctx, k, head_dim, num_heads, L_k, N);  // [N, L_k, H, D]
             auto v4 = ggml_reshape_4d(ctx->ggml_ctx, v, head_dim, num_heads, L_k, N);  // [N, L_k, H, D]
 
-            q4 = q_norm->forward(ctx, q4);
-            k4 = k_norm->forward(ctx, k4);
+            auto q_raw = q4;
+            auto k_raw = k4;
+            q4         = q_norm->forward(ctx, q4);
+            if (!kv_cached) {
+                k4 = k_norm->forward(ctx, k4);
+                if (!kv_cache.empty()) {
+                    // flash attention would cast them to f16 anyway, so caching f16 changes nothing
+                    k4 = ggml_cast(ctx->ggml_ctx, k4, GGML_TYPE_F16);
+                    v  = ggml_cast(ctx->ggml_ctx, v, GGML_TYPE_F16);
+                    ctx->persist_cache_tensor(kv_cache + ".k", k4);
+                    ctx->persist_cache_tensor(kv_cache + ".v", v);
+                }
+            }
 
             ggml_tensor* attn_out = nullptr;
             if (pe_q != nullptr || pe_k != nullptr) {
@@ -237,6 +279,17 @@ namespace Anima {
                 }
                 auto q_rope = Rope::apply_rope(ctx, q4, pe_q, false);
                 auto k_rope = Rope::apply_rope(ctx, k4, pe_k, false);
+                // Keep the un-normalized q/k alive until rope: the rope output is permuted (heads <-> tokens), and
+                // without this the allocator may place it over them, which stops Vulkan from fusing norm and rope.
+                if (q_rope->op == GGML_OP_ROPE_APPLY && k_rope->op == GGML_OP_ROPE_APPLY) {
+                    q_rope->src[2] = q_raw;
+                    k_rope->src[2] = k_raw;
+                    if (ctx->flash_attn_enabled) {
+                        // flash attention takes k in f16; cast here so that the cast holds k_raw too and joins the fusion
+                        k_rope         = ggml_cast(ctx->ggml_ctx, k_rope, GGML_TYPE_F16);
+                        k_rope->src[2] = k_raw;
+                    }
+                }
                 attn_out    = ggml_ext_attention_ext(ctx,
                                                      q_rope,
                                                      k_rope,
@@ -244,7 +297,10 @@ namespace Anima {
                                                      num_heads,
                                                      nullptr,
                                                      true,
-                                                     ctx->flash_attn_enabled);
+                                                     ctx->flash_attn_enabled,
+                                                     1.0f,
+                                                     nullptr,
+                                                     sinks);
             } else {
                 auto q_flat = ggml_reshape_3d(ctx->ggml_ctx, q4, head_dim * num_heads, L_q, N);
                 auto k_flat = ggml_reshape_3d(ctx->ggml_ctx, k4, head_dim * num_heads, L_k, N);
@@ -255,7 +311,10 @@ namespace Anima {
                                                      num_heads,
                                                      nullptr,
                                                      false,
-                                                     ctx->flash_attn_enabled);
+                                                     ctx->flash_attn_enabled,
+                                                     1.0f,
+                                                     nullptr,
+                                                     sinks);
             }
 
             return out_proj->forward(ctx, attn_out);
@@ -274,7 +333,9 @@ namespace Anima {
             auto layer2 = std::dynamic_pointer_cast<Linear>(blocks["layer2"]);
 
             x = layer1->forward(ctx, x);
-            x = ggml_ext_gelu(ctx->ggml_ctx, x, true);
+            // f16 input of layer2, see TransformerBlock::forward; not in place, so that Vulkan can fuse gelu and cast
+            x = ggml_ext_gelu(ctx->ggml_ctx, x, false);
+            x = ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_F16);
             x = layer2->forward(ctx, x);
             return x;
         }
@@ -407,7 +468,10 @@ namespace Anima {
                              ggml_tensor* encoder_hidden_states,
                              ggml_tensor* embedded_timestep,
                              ggml_tensor* temb,
-                             ggml_tensor* image_pe) {
+                             ggml_tensor* image_pe,
+                             int64_t context_zero_pad    = 0,
+                             const std::string& kv_cache = "",
+                             bool kv_cached              = false) {
             auto norm1 = std::dynamic_pointer_cast<AdaLayerNormZero>(blocks["adaln_modulation_self_attn"]);
             auto attn1 = std::dynamic_pointer_cast<AnimaAttention>(blocks["self_attn"]);
             auto norm2 = std::dynamic_pointer_cast<AdaLayerNormZero>(blocks["adaln_modulation_cross_attn"]);
@@ -416,14 +480,19 @@ namespace Anima {
             auto mlp   = std::dynamic_pointer_cast<AnimaMLP>(blocks["mlp"]);
 
             auto [normed1, gate1] = norm1->forward(ctx, hidden_states, embedded_timestep, temb);
+            // The matmuls round their f32 input to f16 anyway (the weights are f16), so casting the inputs gives the
+            // same result; on Vulkan the cast fuses into the norm/gelu, and f16 inputs make the matmuls ~10% faster.
+            normed1               = ggml_cast(ctx->ggml_ctx, normed1, GGML_TYPE_F16);
             auto h                = attn1->forward(ctx, normed1, nullptr, image_pe, image_pe);
             hidden_states         = ggml_add(ctx->ggml_ctx, hidden_states, apply_gate(ctx->ggml_ctx, h, gate1));
 
             auto [normed2, gate2] = norm2->forward(ctx, hidden_states, embedded_timestep, temb);
-            h                     = attn2->forward(ctx, normed2, encoder_hidden_states, nullptr, nullptr);
+            normed2               = ggml_cast(ctx->ggml_ctx, normed2, GGML_TYPE_F16);
+            h                     = attn2->forward(ctx, normed2, encoder_hidden_states, nullptr, nullptr, context_zero_pad, kv_cache, kv_cached);
             hidden_states         = ggml_add(ctx->ggml_ctx, hidden_states, apply_gate(ctx->ggml_ctx, h, gate2));
 
             auto [normed3, gate3] = norm3->forward(ctx, hidden_states, embedded_timestep, temb);
+            normed3               = ggml_cast(ctx->ggml_ctx, normed3, GGML_TYPE_F16);
             h                     = mlp->forward(ctx, normed3);
             hidden_states         = ggml_add(ctx->ggml_ctx, hidden_states, apply_gate(ctx->ggml_ctx, h, gate3));
 
@@ -487,7 +556,9 @@ namespace Anima {
                              ggml_tensor* t5_weights               = nullptr,
                              ggml_tensor* adapter_q_pe             = nullptr,
                              ggml_tensor* adapter_k_pe             = nullptr,
-                             std::vector<ggml_tensor*> ref_latents = {}) {
+                             std::vector<ggml_tensor*> ref_latents = {},
+                             const std::string& kv_cache           = "",
+                             bool kv_cached                        = false) {
             GGML_ASSERT(x->ne[3] == 1);
 
             auto x_embedder       = std::dynamic_pointer_cast<XEmbedder>(blocks["x_embedder"]);
@@ -518,7 +589,12 @@ namespace Anima {
             auto temb              = t_embedder->forward(ctx, timestep_proj);
             auto embedded_timestep = t_embedding_norm->forward(ctx, timestep_proj);
 
-            if (t5_ids != nullptr) {
+            int64_t context_zero_pad = 0;
+            if (t5_ids != nullptr && kv_cached) {
+                // the cross attention k/v of every block are cached, so the adapter is not needed
+                context_zero_pad      = std::max<int64_t>(0, 512 - t5_ids->ne[0]);
+                encoder_hidden_states = nullptr;
+            } else if (t5_ids != nullptr) {
                 auto adapted_context = llm_adapter->forward(ctx, encoder_hidden_states, t5_ids, adapter_q_pe, adapter_k_pe);
                 if (t5_weights != nullptr) {
                     auto w = t5_weights;
@@ -529,12 +605,8 @@ namespace Anima {
                     adapted_context = ggml_mul(ctx->ggml_ctx, adapted_context, w);
                 }
                 if (adapted_context->ne[1] < 512) {
-                    auto pad_ctx    = ggml_ext_zeros(ctx->ggml_ctx,
-                                                     adapted_context->ne[0],
-                                                     512 - adapted_context->ne[1],
-                                                     adapted_context->ne[2],
-                                                     1);
-                    adapted_context = ggml_concat(ctx->ggml_ctx, adapted_context, pad_ctx, 1);
+                    // padded to 512 tokens with zeros; the zero keys/values are appended inside cross attention
+                    context_zero_pad = 512 - adapted_context->ne[1];
                 } else if (adapted_context->ne[1] > 512) {
                     adapted_context = ggml_ext_slice(ctx->ggml_ctx, adapted_context, 1, 0, 512);
                 }
@@ -544,11 +616,14 @@ namespace Anima {
             sd::ggml_graph_cut::mark_graph_cut(x, "anima.prelude", "x");
             sd::ggml_graph_cut::mark_graph_cut(embedded_timestep, "anima.prelude", "embedded_timestep");
             sd::ggml_graph_cut::mark_graph_cut(temb, "anima.prelude", "temb");
-            sd::ggml_graph_cut::mark_graph_cut(encoder_hidden_states, "anima.prelude", "context");
+            if (encoder_hidden_states != nullptr) {
+                sd::ggml_graph_cut::mark_graph_cut(encoder_hidden_states, "anima.prelude", "context");
+            }
 
             for (int i = 0; i < config.num_layers; i++) {
                 auto block = std::dynamic_pointer_cast<TransformerBlock>(blocks["blocks." + std::to_string(i)]);
-                x          = block->forward(ctx, x, encoder_hidden_states, embedded_timestep, temb, image_pe);
+                x          = block->forward(ctx, x, encoder_hidden_states, embedded_timestep, temb, image_pe, context_zero_pad,
+                                            kv_cache.empty() ? kv_cache : kv_cache + "." + std::to_string(i), kv_cached);
                 sd::ggml_graph_cut::mark_graph_cut(x, "anima.blocks." + std::to_string(i), "x");
             }
             x = ggml_ext_slice(ctx->ggml_ctx, x, 1, 0, img_len);
@@ -692,7 +767,31 @@ namespace Anima {
                 set_backend_tensor_data(adapter_k_pe, adapter_k_pe_vec.data());
             }
 
-            auto runner_ctx = get_context();
+            // The text side (adapter, cross attention k/v) is the same for every step of a generation; the first step
+            // with a given context caches the k/v of all blocks and the next ones reuse them. The runner cache lives
+            // until the end of the generation, and the key covers everything the k/v depend on.
+            std::string kv_cache;
+            bool kv_cached = false;
+            if (t5_ids != nullptr && context != nullptr) {
+                uint64_t key = 1469598103934665603ULL;
+                auto mix     = [&](const void* data, size_t bytes) {
+                    for (size_t i = 0; i < bytes; ++i) {
+                        key = (key ^ static_cast<const uint8_t*>(data)[i]) * 1099511628211ULL;
+                    }
+                };
+                for (int64_t d : context_tensor.shape()) mix(&d, sizeof(d));
+                for (int64_t d : t5_ids_tensor.shape()) mix(&d, sizeof(d));
+                mix(context_tensor.data(), context_tensor.numel() * sizeof(float));
+                mix(t5_ids_tensor.data(), t5_ids_tensor.numel() * sizeof(int32_t));
+                if (!t5_weights_tensor.empty()) {
+                    mix(t5_weights_tensor.data(), t5_weights_tensor.numel() * sizeof(float));
+                }
+                kv_cache  = "anima.cross_kv." + std::to_string(key);
+                kv_cached = get_cache_tensor_by_name(kv_cache + ".0.k") != nullptr &&
+                            get_cache_tensor_by_name(kv_cache + "." + std::to_string(config.num_layers - 1) + ".v") != nullptr;
+            }
+
+            auto runner_ctx = get_context(gf);
             auto out        = net.forward(&runner_ctx,
                                           x,
                                           timesteps,
@@ -702,7 +801,9 @@ namespace Anima {
                                           t5_weights,
                                           adapter_q_pe,
                                           adapter_k_pe,
-                                          ref_latents);
+                                          ref_latents,
+                                          kv_cache,
+                                          kv_cached);
 
             ggml_build_forward_expand(gf, out);
             return gf;

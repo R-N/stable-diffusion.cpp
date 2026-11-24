@@ -11,6 +11,26 @@
 #include "core/util.h"
 #include "model/adapter/lora.hpp"
 
+// Vulkan backend extension (ggml-vulkan.h); weak so that builds without the Vulkan backend still link
+extern "C" bool ggml_backend_vk_tile_f16_weight(struct ggml_tensor* tensor) __attribute__((weak));
+
+// Anima DiT weights whose matmul always has more than 8 columns: self-attention, cross-attention q and output, MLP
+static bool vk_tile_candidate(const std::string& name) {
+    if (name.find("blocks.") == std::string::npos || name.find("llm_adapter") != std::string::npos) {
+        return false;
+    }
+    static const char* suffixes[] = {"self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight",
+                                     "self_attn.output_proj.weight", "cross_attn.q_proj.weight", "cross_attn.output_proj.weight",
+                                     "mlp.layer1.weight", "mlp.layer2.weight"};
+    for (const char* suffix : suffixes) {
+        const std::string sfx(suffix);
+        if (name.size() >= sfx.size() && name.compare(name.size() - sfx.size(), sfx.size(), sfx) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static size_t aligned_offset(const void* buffer, size_t offset, size_t alignment) {
     GGML_ASSERT(alignment != 0 && (alignment & (alignment - 1)) == 0);
     size_t align = (alignment - ((reinterpret_cast<uintptr_t>(buffer) + offset) % alignment)) % alignment;
@@ -472,6 +492,21 @@ bool ModelManager::load_tensors_to_params_backend(const std::vector<TensorState*
         }
         return false;
     }
+    if (ggml_backend_vk_tile_f16_weight != nullptr && loras_.empty()) {
+        const char* tile_env = getenv("SD_VK_TILE");
+        if (tile_env != nullptr && tile_env[0] == '1') {
+            size_t tiled = 0;
+            for (TensorState* state : need_load) {
+                if (state != nullptr && state->tensor != nullptr && vk_tile_candidate(state->name) &&
+                    ggml_backend_vk_tile_f16_weight(state->tensor)) {
+                    ++tiled;
+                }
+            }
+            if (tiled > 0) {
+                LOG_INFO("tiled %zu f16 weights for the Vulkan matmul", tiled);
+            }
+        }
+    }
     struct PrepareStats {
         size_t bytes   = 0;
         size_t tensors = 0;
@@ -649,6 +684,10 @@ bool ModelManager::apply_loras_to_params(const std::vector<TensorState*>& states
         }
         if (state->applied_lora_epoch == current_lora_epoch_) {
             continue;
+        }
+        if ((state->tensor->flags & GGML_TENSOR_FLAG_TILED_F16) != 0) {
+            LOG_ERROR("lora cannot be applied to the tiled weight '%s'; run without SD_VK_TILE=1", state->name.c_str());
+            return false;
         }
         if (state->compute_backend == nullptr) {
             LOG_ERROR("model manager compute backend is null for lora target tensor '%s'", state->name.c_str());
@@ -1321,6 +1360,34 @@ void ModelManager::release_all() {
     }
     release_compute_staging_blocks(true);
     release_params_storage_blocks(true);
+}
+
+void ModelManager::release_component_params(ModelComponent component) {
+    clear_all_prefetched_params();
+    std::unordered_set<TensorState*> targets;
+    for (const auto& state : tensor_states_) {
+        if (state != nullptr && state->component == component && state->pin_count == 0) {
+            targets.insert(state.get());
+        }
+    }
+    release_compute_staging_blocks(false, &targets);
+    size_t bytes = 0;
+    for (auto it = params_storage_blocks_.begin(); it != params_storage_blocks_.end();) {
+        ParamsStorageBlock* block = it->get();
+        const bool all_target     = std::all_of(block->states.begin(), block->states.end(), [&](TensorState* state) {
+            return state == nullptr || (targets.count(state) != 0 && !state->staged_to_compute_backend);
+        });
+        if (all_target) {
+            if (block->buffer != nullptr) {
+                bytes += ggml_backend_buffer_get_size(block->buffer);
+            }
+            free_params_storage_block(*block);
+            it = params_storage_blocks_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    LOG_INFO("released %.2f MB of component params", bytes / (1024.f * 1024.f));
 }
 
 ggml_tensor* ModelManager::resolve_param_tensor(ggml_tensor* tensor) const {

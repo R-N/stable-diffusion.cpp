@@ -772,7 +772,9 @@ namespace sd::pipeline {
         }
 
         if (sd_version_is_ltxav(sd->version)) {
-            latents.audio_length = get_ltxav_num_audio_latents(request->frames, request->fps);
+            // SD_LTX_NO_AUDIO=1: video only; the audio stream of the transformer is skipped (run_ax) and no audio is decoded
+            const bool no_audio  = std::getenv("SD_LTX_NO_AUDIO") != nullptr;
+            latents.audio_length = no_audio ? 0 : get_ltxav_num_audio_latents(request->frames, request->fps);
             latents.audio_latent = make_ltxav_empty_audio_latent(latents.audio_length);
         }
 
@@ -1978,6 +1980,9 @@ namespace sd::pipeline {
             LOG_ERROR("cancelling generation before video decode");
             free_sd_audio(generated_audio);
             return false;
+        }
+        if (sd->model_manager != nullptr && std::getenv("SD_FREE_DIFFUSION_BEFORE_DECODE") != nullptr) {
+            sd->model_manager->release_component_params(ModelComponent::Diffusion);
         }
         auto result = decode_video_outputs(sd, latent_upscale_enabled ? hires_request : request, final_latent, num_frames_out);
         LOG_DEBUG("decode_video_outputs returned %s", result == nullptr ? "nullptr (failed)" : "frames");

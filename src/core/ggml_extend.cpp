@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "core/ggml_extend.h"
 
 #include <cmath>
@@ -207,6 +208,8 @@ ggml_tensor* ggml_ext_gelu_quick(ggml_context* ctx,
     return x;
 }
 
+thread_local bool g_ggml_ext_gpu_graph = false;
+
 ggml_tensor* ggml_ext_linear(ggml_context* ctx,
                              ggml_tensor* x,
                              ggml_tensor* w,
@@ -215,6 +218,11 @@ ggml_tensor* ggml_ext_linear(ggml_context* ctx,
                              float scale) {
     if (scale != 1.f) {
         x = ggml_ext_scale(ctx, x, scale);
+    }
+    static const bool f16_activations = std::getenv("SD_VK_F16_ACT") != nullptr;
+    if (f16_activations && g_ggml_ext_gpu_graph && ggml_is_quantized(w->type) && x->type == GGML_TYPE_F32) {
+        // half the activation traffic into the dequantizing matmul (and its f16 shader path)
+        x = ggml_cast(ctx, x, GGML_TYPE_F16);
     }
     if (x->ne[2] * x->ne[3] > 1024) {
         // workaround: avoid ggml cuda error
@@ -630,7 +638,8 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                                     bool flash_attn,
                                     float kv_scale,
                                     bool sage_attn,
-                                    bool* used_flash_attn) {  // avoid overflow
+                                    bool* used_flash_attn,
+                                    ggml_tensor* sinks) {  // avoid overflow
     if (used_flash_attn != nullptr) {
         *used_flash_attn = false;
     }
@@ -648,13 +657,16 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         d_head    = C / n_head;
         n_kv_head = k->ne[0] / d_head;
 
-        q = ggml_reshape_4d(ctx, q, d_head, n_head, L_q, N);       // [N, L_q, n_head, d_head]
-        q = ggml_ext_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));  // [N, n_head, L_q, d_head]
-        q = ggml_reshape_3d(ctx, q, d_head, L_q, n_head * N);      // [N * n_head, L_q, d_head]
-
-        k = ggml_reshape_4d(ctx, k, d_head, n_kv_head, L_k, N);    // [N, L_k, n_kv_head, d_head]
-        k = ggml_ext_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));  // [N, n_kv_head, L_k, d_head]
-        k = ggml_reshape_3d(ctx, k, d_head, L_k, n_kv_head * N);   // [N * n_kv_head, L_k, d_head]
+        q = ggml_reshape_4d(ctx, q, d_head, n_head, L_q, N);     // [N, L_q, n_head, d_head]
+        q = ggml_permute(ctx, q, 0, 2, 1, 3);                    // [N, n_head, L_q, d_head]
+        k = ggml_reshape_4d(ctx, k, d_head, n_kv_head, L_k, N);  // [N, L_k, n_kv_head, d_head]
+        k = ggml_permute(ctx, k, 0, 2, 1, 3);                    // [N, n_kv_head, L_k, d_head]
+        if (N > 1) {
+            q = ggml_reshape_3d(ctx, ggml_cont(ctx, q), d_head, L_q, n_head * N);     // [N * n_head, L_q, d_head]
+            k = ggml_reshape_3d(ctx, ggml_cont(ctx, k), d_head, L_k, n_kv_head * N);  // [N * n_kv_head, L_k, d_head]
+        }
+        // with N == 1 the permuted views go to flash attention as is (it takes strides), saving a copy of q;
+        // k is made contiguous by the cast to f16
 
         v = ggml_reshape_4d(ctx, v, d_head, n_kv_head, L_k, N);  // [N, L_k, n_kv_head, d_head]
     } else {
@@ -674,6 +686,10 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         const bool pad_head = d_head > 0 && d_head < 64 && q_in->ne[0] == d_head && k_in->ne[0] == d_head &&
                               q_in->type == GGML_TYPE_F32 && k_in->type == GGML_TYPE_F32 &&
                               v_in->type == GGML_TYPE_F32 && sd_backend_supports_cuda_mma(backend);
+        if (pad_head || kv_scale != 1.0f) {
+            q_in = ggml_ext_cont(ctx, q_in);
+            k_in = ggml_ext_cont(ctx, k_in);
+        }
         if (pad_head) {
             // CUDA FA MMA starts at 64 channels; keep the original head's attention scale.
             q_in = ggml_pad(ctx, q_in, static_cast<int>(64 - d_head), 0, 0, 0);
@@ -682,9 +698,15 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         if (kv_scale != 1.0f) {
             k_in = ggml_ext_scale(ctx, k_in, kv_scale);
         }
-        k_in = ggml_cast(ctx, k_in, GGML_TYPE_F16);
+        if (k_in->type != GGML_TYPE_F16) {
+            k_in = ggml_cast(ctx, k_in, GGML_TYPE_F16);
+        }
 
-        v_in = ggml_ext_cont(ctx, ggml_permute(ctx, v_in, 0, 2, 1, 3));
+        v_in = ggml_permute(ctx, v_in, 0, 2, 1, 3);
+        if (!pad_head && kv_scale == 1.0f) {
+            v_in = ggml_cast(ctx, v_in, GGML_TYPE_F16);  // permute and cast in one copy
+        }
+        v_in = ggml_ext_cont(ctx, v_in);
         v_in = ggml_reshape_3d(ctx, v_in, d_head, L_k, n_kv_head * N);
         if (pad_head) {
             v_in = ggml_pad(ctx, v_in, static_cast<int>(64 - d_head), 0, 0, 0);
@@ -692,7 +714,9 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         if (kv_scale != 1.0f) {
             v_in = ggml_ext_scale(ctx, v_in, kv_scale);
         }
-        v_in = ggml_cast(ctx, v_in, GGML_TYPE_F16);
+        if (v_in->type != GGML_TYPE_F16) {
+            v_in = ggml_cast(ctx, v_in, GGML_TYPE_F16);
+        }
 
         if (mask_in != nullptr) {
             // ggml_flash_attn_ext expects the mask as a contiguous F16 tensor shaped
@@ -711,6 +735,9 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         }
 
         auto out = ggml_flash_attn_ext(ctx, q_in, k_in, v_in, mask_in, scale / kv_scale, 0, 0);
+        if (sinks != nullptr) {
+            ggml_flash_attn_ext_add_sinks(out, sinks);
+        }
         if (!ggml_backend_supports_op(backend, out)) {
             return nullptr;
         }
@@ -725,7 +752,7 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
     };
 
 #ifndef SD_USE_UPSTREAM_GGML
-    if (sage_attn && mask == nullptr && d_head > 0 && d_head <= 128) {
+    if (sage_attn && mask == nullptr && sinks == nullptr && d_head > 0 && d_head <= 128) {
         auto q_in                 = ggml_reshape_4d(ctx, ggml_ext_cont(ctx, q->type == GGML_TYPE_F32 ? q : ggml_cast(ctx, q, GGML_TYPE_F32)), d_head, L_q, n_head, N);
         auto k_in                 = ggml_reshape_4d(ctx, ggml_ext_cont(ctx, k->type == GGML_TYPE_F32 ? k : ggml_cast(ctx, k, GGML_TYPE_F32)), d_head, L_k, n_kv_head, N);
         auto v_in                 = ggml_ext_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
@@ -786,6 +813,10 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         // if (flash_attn) {
         //     LOG_VERBOSE("fallback to default attention, L_q:%d L_k:%d n_head:%d C:%d d_head:%d N:%d", L_q, L_k, n_head, C, d_head, N);
         // }
+        if (!ggml_is_contiguous(q)) {
+            q = ggml_reshape_3d(ctx, ggml_cont(ctx, q), d_head, L_q, n_head * N);
+            k = ggml_reshape_3d(ctx, ggml_cont(ctx, k), d_head, L_k, n_kv_head * N);
+        }
         v = ggml_ext_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3));  // [N, n_kv_head, d_head, L_k]
         v = ggml_reshape_3d(ctx, v, L_k, d_head, n_kv_head * N);   // [N * n_kv_head, d_head, L_k]
 
@@ -796,6 +827,9 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
             kq = ggml_add_inplace(ctx, kq, mask);
         }
         kq = ggml_soft_max_inplace(ctx, kq);
+        if (sinks != nullptr) {
+            ggml_soft_max_add_sinks(kq, sinks);
+        }
 
         kqv = ggml_mul_mat(ctx, v, kq);  // [N * n_head, L_q, d_head]
 

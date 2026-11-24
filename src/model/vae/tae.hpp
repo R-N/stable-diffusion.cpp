@@ -449,9 +449,11 @@ class TinyVideoDecoder : public UnaryBlock {
 
 public:
     int t_upscale = 1;
+    std::vector<bool> layer_time_upscale;
     TinyVideoDecoder(int z_channels = 4, int patch_size = 1, std::vector<bool> time_upscale = {false, true, true}, bool is_wide = false)
         : z_channels(z_channels), patch_size(patch_size), is_wide(is_wide) {
-        t_upscale = 1;
+        t_upscale          = 1;
+        layer_time_upscale = time_upscale;
         if (is_wide) {
             channels[0] = 1024;
             channels[1] = 512;
@@ -496,6 +498,10 @@ public:
         h         = first_conv->forward(ctx, h);
         h         = ggml_relu_inplace(ctx->ggml_ctx, h);
         int index = 3;
+        // The time upscales produce t_upscale - 1 leading frames that are cut off at the end. Everything after the
+        // memory blocks of the last layer works frame by frame, so input frames that only feed cut frames are
+        // dropped there (for one latent frame: 4 -> 1 frames through the full-resolution convolutions).
+        int64_t to_trim = t_upscale - 1;
         for (int i = 0; i < num_layers; i++) {
             for (int j = 0; j < num_blocks; j++) {
                 auto mem = ggml_ext_pad_ext(ctx->ggml_ctx, ctx->backend, h, 0, 0, 0, 0, 0, 0, 1, 0);
@@ -507,6 +513,13 @@ public:
                     auto block = std::dynamic_pointer_cast<MemBlock>(blocks[std::to_string(index++)]);
                     h          = block->forward(ctx, h, mem);
                 }
+            }
+            const int64_t stride = layer_time_upscale[i] ? 2 : 1;
+            if (i == num_layers - 1 && stride > 1 && to_trim >= stride) {
+                const int64_t drop_in = std::min<int64_t>(to_trim / stride, h->ne[3] - 1);
+                h                     = ggml_view_4d(ctx->ggml_ctx, h, h->ne[0], h->ne[1], h->ne[2], h->ne[3] - drop_in,
+                                                     h->nb[1], h->nb[2], h->nb[3], drop_in * h->nb[3]);
+                to_trim -= drop_in * stride;
             }
             // upsample
             index++;
@@ -524,7 +537,7 @@ public:
             h = unpatchify(ctx->ggml_ctx, h, patch_size, 1);
         }
         // shape(W, H, 3, (t_upscale - 1) + T) => shape(W, H, 3, T)
-        h = ggml_view_4d(ctx->ggml_ctx, h, h->ne[0], h->ne[1], h->ne[2], h->ne[3] - (t_upscale - 1), h->nb[1], h->nb[2], h->nb[3], (t_upscale - 1) * h->nb[3]);
+        h = ggml_view_4d(ctx->ggml_ctx, h, h->ne[0], h->ne[1], h->ne[2], h->ne[3] - to_trim, h->nb[1], h->nb[2], h->nb[3], to_trim * h->nb[3]);
         return h;
     }
 };

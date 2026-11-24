@@ -179,6 +179,10 @@ private:
 public:
     ~ModelManager() override;
 
+    // Frees the parameter buffers of one component (e.g. the diffusion model after sampling, before the VAE needs the
+    // memory). Tensors are reloaded from their files if the component is used again.
+    void release_component_params(ModelComponent component);
+
     const ModelLoader& loader() const { return model_loader_; }
 
     bool set_loader(ModelLoader loader);

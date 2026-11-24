@@ -297,7 +297,11 @@ public:
 
         auto net_0 = std::dynamic_pointer_cast<UnaryBlock>(blocks["net.0"]);
         auto net_2 = std::dynamic_pointer_cast<Linear>(blocks["net.2"]);
-        if (sd_backend_is(ctx->backend, "Vulkan") || sd_backend_is(ctx->backend, "ROCm")) {
+        if (sd_backend_is(ctx->backend, "Vulkan")) {
+            // The input scale keeps f16 accumulation from overflowing; f32 accumulation is a slower shader on Vulkan
+            // (SDXL on Vega: FFN down 736 vs 1150 GFLOPS, step -1.5%).
+            net_2->set_scale(1.f / 128.f);
+        } else if (sd_backend_is(ctx->backend, "ROCm")) {
             net_2->set_force_prec_f32(true);
         }
 

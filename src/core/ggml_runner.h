@@ -133,7 +133,8 @@ ggml_tensor* ggml_ext_attention_ext(GGMLRunnerContext* ctx,
                                     bool skip_reshape     = false,
                                     bool flash_attn       = false,
                                     float kv_scale        = 1.f,
-                                    bool* used_flash_attn = nullptr);
+                                    bool* used_flash_attn = nullptr,
+                                    ggml_tensor* sinks    = nullptr);
 
 struct GGMLRunner {
 private:

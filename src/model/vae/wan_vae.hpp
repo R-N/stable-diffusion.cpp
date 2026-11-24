@@ -86,6 +86,21 @@ namespace WAN {
                 lp2 -= (int)cache_x->ne[2];
             }
 
+            if (cache_x == nullptr && x->ne[2] == 1 && lp2 > 0 && w->ne[2] == lp2 + 1 && x->ne[3] == in_channels &&
+                std::get<0>(stride) == 1 && std::get<0>(dilation) == 1) {
+                // A single frame behind lp2 zero frames only meets the last temporal tap of the kernel,
+                // so the conv3d is a conv2d with that slice (3x less work for image decodes).
+                x                = ggml_ext_pad_ext(ctx->ggml_ctx, ctx->backend, x, lp0, rp0, lp1, rp1, 0, 0, 0, 0, ctx->circular_x_enabled, ctx->circular_y_enabled);
+                ggml_tensor* x2  = ggml_reshape_4d(ctx->ggml_ctx, ggml_cont(ctx->ggml_ctx, x), x->ne[0], x->ne[1], in_channels, 1);
+                ggml_tensor* w2  = ggml_view_4d(ctx->ggml_ctx, w, w->ne[0], w->ne[1], 1, w->ne[3], w->nb[1], w->nb[2], w->nb[3], (size_t)lp2 * w->nb[2]);
+                w2               = ggml_reshape_4d(ctx->ggml_ctx, ggml_cont(ctx->ggml_ctx, w2), w->ne[0], w->ne[1], in_channels, out_channels);
+                x2               = ggml_ext_conv_2d(ctx->ggml_ctx, x2, w2, b,
+                                                    std::get<2>(stride), std::get<1>(stride), 0, 0,
+                                                    std::get<2>(dilation), std::get<1>(dilation),
+                                                    ctx->conv2d_direct_enabled, false, false, scale);
+                return ggml_reshape_4d(ctx->ggml_ctx, x2, x2->ne[0], x2->ne[1], 1, out_channels);
+            }
+
             x = ggml_ext_pad_ext(ctx->ggml_ctx, ctx->backend, x, lp0, rp0, lp1, rp1, lp2, rp2, 0, 0, ctx->circular_x_enabled, ctx->circular_y_enabled);
             if (w->ne[2] == 1 && x->ne[2] == 1 && x->ne[3] == in_channels) {
                 // One frame through a one-frame-deep kernel is a 2D conv; backends without
