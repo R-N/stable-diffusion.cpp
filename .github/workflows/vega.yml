@@ -1,0 +1,51 @@
+name: Vega Vulkan release
+
+# Linux Vulkan build of the vega-igpu branch, published as a release for R-N/audio (texture_ai.SD).
+on:
+  workflow_dispatch:
+  push:
+    branches: [vega-igpu]
+    paths: [".github/workflows/vega.yml", "**/*.cpp", "**/*.hpp", "**/*.h", "**/*.c", "**/*.comp", "**/*.glsl", "**/CMakeLists.txt", "ggml"]
+
+permissions:
+  contents: write
+
+jobs:
+  linux-vulkan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.15.1
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libvulkan-dev glslc zip
+          # the Vega patch's shaders want newer SPIR-V headers than the distro's (as its scripts/build.sh does)
+          git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git /tmp/spirv
+          cmake -S /tmp/spirv -B /tmp/spirv/build -DCMAKE_INSTALL_PREFIX=/tmp/prefix -DSPIRV_HEADERS_ENABLE_TESTS=OFF
+          cmake --install /tmp/spirv/build
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSD_BUILD_SHARED_LIBS=ON -DSD_VULKAN=ON -DGGML_NATIVE=OFF \
+            -DSD_BUILD_SHARED_GGML_LIB=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_PREFIX_PATH=/tmp/prefix -DCMAKE_CXX_FLAGS=-I/tmp/prefix/include
+          cmake --build build --config Release -j"$(nproc)"
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          short=$(git rev-parse --short=7 HEAD)
+          zipname="sd-vega-$short-bin-Linux-x86_64-vulkan.zip"
+          cp ggml/LICENSE build/bin/ggml.txt
+          cp LICENSE build/bin/stable-diffusion.cpp.txt
+          zip -j "$zipname" build/bin/*
+          gh release create "vega-$short" "$zipname" --target "$GITHUB_SHA" --title "vega-$short" \
+            --notes "stable-diffusion.cpp vega-igpu branch at $short: ayanoby/vega-igpu-diffusion patches (MIT), Linux Vulkan."
